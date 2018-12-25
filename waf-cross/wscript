@@ -1,0 +1,159 @@
+import glob
+import os
+import sys
+
+from waflib import Configure,Options,Utils,Logs
+from waflib.Tools import ccroot,ar
+from waflib.Configure import conf
+
+# Source to compile
+src_dir = os.path.join(os.path.dirname(os.getcwd()), 'src')
+
+# Installation location
+install_prefix = os.path.join(os.path.dirname(os.getcwd()), 'build')
+
+def options(ctx):
+    # Behavior:
+    #           --ndks <ndks_path> droid21_arm droid21_arm64 builds  droid21 arm
+    #           no --ndks or environ var (ANDROID_NDKS), uses native environment
+    group = ctx.add_option_group("android-specific config")
+    group.add_option("--ndks", action = "store",
+                     dest = "ANDROID_NDKS",
+                     default = os.getenv("ANDROID_NDKS"),
+                     help = "Android NDKs root")
+    group.add_option('--target', action="store",
+                     dest = "target",
+                     help= "<android-apiversion>_<architecture>")
+    ctx.load('compiler_cxx')
+    ctx.load('compiler_c')
+
+def _parse_ndks(ctx):
+    """Expected structure:
+        $ANDROID_NDKS/
+            android-21/
+                arm/
+                arm64
+                x86/
+                x86_64
+            android-21/
+                ...
+        Returns: {<api_version>: [<arch>, <arch>, ...]}
+    """
+    ndks = {}
+    for api_version in glob.glob('{}/android-*'.format(ctx.options.ANDROID_NDKS)):
+        api_version = os.path.basename(api_version)
+        ndks[api_version] = []
+        for architecture in os.listdir(os.path.join(ctx.options.ANDROID_NDKS, api_version)):
+            ndks[api_version].append(architecture)
+    return ndks
+
+def ndk_list(ctx):
+    if not ctx.options.ANDROID_NDKS:
+        raise Exception("no NDKs path (--ndks)")
+    for api_version,architectures in _parse_ndks(ctx).items():
+        for arch in architectures:
+            Logs.info('{}_{}'.format(api_version, arch))
+
+def configure(ctx):
+    ################################################
+    # Android (NDK)
+    ctx.env.ANDROID_NDKS = ctx.options.ANDROID_NDKS
+    if ctx.env.ANDROID_NDKS:
+        if not ctx.options.target:
+            raise Exception("No target specified (--target)")
+        target = ctx.options.target
+
+        # Determine & validate all compatible version+archs given ANDROID_NDKS
+        for api_version,architectures in _parse_ndks(ctx).items():
+            ctx.env.ANDROID_COMPAT = []
+            ndk_toolchain_api_path = os.path.join(ctx.options.ANDROID_NDKS, api_version)
+            for arch in architectures:
+                compat = {'name': api_version}
+                ndk_toolchain_arch_path = os.path.join(ndk_toolchain_api_path, arch)
+                Logs.info('configuring api_version: {} architecture: {}'.format(api_version, arch))
+                if arch == 'arm':
+                    bin_prefix = "arm-linux-androideabi-"
+                    ndk_toolchain_bin_path = os.path.join(ndk_toolchain_arch_path, 'bin')
+                elif arch == 'arm64':
+                    bin_prefix = "aarch64-linux-android-"
+                    ndk_toolchain_bin_path = os.path.join(ndk_toolchain_arch_path, 'bin')
+                else:
+                    bin_prefix = ''
+                    Logs.warn('arch {} not implemented yet, skipping'.format(arch))
+                    continue
+                if bin_prefix:
+                    CC = ctx.find_program('{}gcc'.format(bin_prefix),
+                                      path_list=ndk_toolchain_bin_path,
+                                      mandatory=True)
+                    CXX = ctx.find_program('{}g++'.format(bin_prefix), 
+                                      path_list=ndk_toolchain_bin_path,
+                                      mandatory=True)
+                    AR = ctx.find_program('{}ar'.format(bin_prefix), 
+                                      path_list=ndk_toolchain_bin_path,
+                                      mandatory=True)
+                    LD = ctx.find_program('{}ld'.format(bin_prefix), 
+                                      path_list=ndk_toolchain_bin_path,
+                                      mandatory=True)
+                    STRIP = ctx.find_program('{}strip'.format(bin_prefix), 
+                                      path_list=ndk_toolchain_bin_path,
+                                      mandatory=True)
+                    LDFLAGS = '-L{}'.format(os.path.join(ndk_toolchain_arch_path, 'libs'))
+                    CFLAGS = '-I{}'.format(os.path.join(ndk_toolchain_arch_path, 'include'))
+                    CXXFLAGS = '-I{}'.format(os.path.join(ndk_toolchain_arch_path, 'include'))
+                    compat.update({'architecture': arch,
+                                   'CC': CC,
+                                   'CXX': CXX,
+                                   'AR': AR,
+                                   'LD': LD,
+                                   'STRIP': STRIP,
+                                   'LDFLAGS': LDFLAGS,
+                                   'CFLAGS': CFLAGS,
+                                   'CXXFLAGS': CXXFLAGS})
+                    ctx.env.ANDROID_COMPAT.append(compat)
+                    Logs.info('done configuring')
+                    
+        # Validate desired target against compatible
+        Logs.info('validating target: {}'.format(target))
+        t_api_version = target.split('_')[0]#.replace('android','')
+        t_architecture = target.split('_')[1]
+        if not any((t_api_version == c['name'] and t_architecture == c['architecture']) for c in ctx.env.ANDROID_COMPAT):
+            ctx.fatal('{} is not compatible or has an incomplete NDK.  See ./waf ndk_list'.format(t))
+
+        for c in ctx.env.ANDROID_COMPAT:
+            if (t_api_version == c['name'] and \
+               t_architecture == c['architecture']):
+                # Do actual configuration
+                ctx.env.CXX = c['CXX']
+                ctx.env.CC = c['CC']
+                ctx.env.AR = c['AR']
+                ctx.env.LD = c['LD'],
+                ctx.env.STRIP =  c['STRIP']
+                ctx.env.append_value('LDFLAGS', c['LDFLAGS'])
+                ctx.env.append_value('CFLAGS', c['CFLAGS'])
+                ctx.env.append_value('CXXFLAGS', c['CXXFLAGS'])
+                break
+    ################################################
+    # Native
+    # Build defaults to host env
+    else:
+        ctx.find_program('gcc', mandatory=True)
+        ctx.find_program('g++', mandatory=True)
+        ctx.find_program('ar', mandatory=True)
+        ctx.find_program('ld', mandatory=True)
+        ctx.find_program('strip', mandatory=True)
+    ctx.load('compiler_c')
+    ctx.load('compiler_cxx')
+def build(bld):
+    if bld.env.TARGET:
+        ################################################
+        # Cross-compilation
+        target_dir = os.path.join(install_prefix, target['name'], target['architecture'])
+        os.makedirs(target_dir)
+    else:
+        ################################################
+        # Native
+        target_dir = install_prefix
+
+    target = os.path.join(target_dir, 'main')
+    bld.program(target='test',
+                 source='src/main.c')
